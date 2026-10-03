@@ -1,0 +1,13 @@
+#!/bin/sh
+
+# Reinitialize the ThinkPad TrackPoint after suspend/resume.
+case "$1" in
+    post)
+        /usr/sbin/modprobe -r psmouse || true
+        /usr/bin/sleep 4
+        /usr/sbin/modprobe psmouse
+        /usr/bin/sleep 2
+        ;;
+esac
+
+exit 0
