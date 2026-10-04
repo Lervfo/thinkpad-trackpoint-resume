@@ -1,31 +1,24 @@
-#!/bin/sh
-set -eu
-
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-
-if [ "$(id -u)" -ne 0 ]; then
-    if command -v pkexec >/dev/null 2>&1; then
-        exec pkexec "$script_dir/uninstall.sh" "$@"
+if (( EUID != 0 )); then
+    if command -v pkexec >/dev/null; then
+        exec pkexec /bin/bash "$script_dir/uninstall.sh" "$@"
     fi
-    if command -v sudo >/dev/null 2>&1; then
-        exec sudo "$script_dir/uninstall.sh" "$@"
+    exec sudo /bin/bash "$script_dir/uninstall.sh" "$@"
+fi
+exec 9>/run/lock/x1c6-touchpad-resume-recover.lock
+flock -w 120 9
+backup_dir=$(mktemp -d /var/backups/thinkpad-trackpoint-uninstall.XXXXXX)
+for unit in systemd-suspend systemd-hibernate systemd-hybrid-sleep systemd-suspend-then-hibernate; do
+    target="/etc/systemd/system/$unit.service.d/60-trackpoint-resume.conf"
+    if [[ -f "$target" ]]; then
+        mv -- "$target" "$backup_dir/$unit.conf"
     fi
-    printf '%s\n' 'Root access is required. Install pkexec or sudo, then run this script again.' >&2
-    exit 1
+done
+systemctl daemon-reload
+if [[ -f /usr/local/sbin/trackpoint-resume ]]; then
+    mv /usr/local/sbin/trackpoint-resume "$backup_dir/trackpoint-resume"
 fi
-
-if [ -d /usr/lib/systemd/system-sleep ]; then
-    target=/usr/lib/systemd/system-sleep/trackpoint-resume
-elif [ -d /lib/systemd/system-sleep ]; then
-    target=/lib/systemd/system-sleep/trackpoint-resume
-else
-    printf '%s\n' 'Could not find a systemd sleep-hook directory.' >&2
-    exit 1
-fi
-
-if [ -e "$target" ]; then
-    /bin/rm -f "$target"
-    printf 'Removed %s\n' "$target"
-else
-    printf 'Nothing to remove at %s\n' "$target"
-fi
+printf 'Recovery uninstalled; files preserved in %s\n' "$backup_dir"
