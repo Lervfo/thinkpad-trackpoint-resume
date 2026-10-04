@@ -1,13 +1,105 @@
-#!/bin/sh
+#!/bin/bash
+set -euo pipefail
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-# Reinitialize the ThinkPad TrackPoint after suspend/resume.
-case "$1" in
-    post)
-        /usr/sbin/modprobe -r psmouse || true
-        /usr/bin/sleep 4
-        /usr/sbin/modprobe psmouse
-        /usr/bin/sleep 2
-        ;;
-esac
+log() {
+    printf 'trackpoint-resume: %s\n' "$*" >&2
+}
 
-exit 0
+devices_ready() {
+    local name_file name event_dir have_pad=0 have_point=0
+    for name_file in /sys/class/input/input*/name; do
+        [[ -r "$name_file" ]] || continue
+        IFS= read -r name < "$name_file" || continue
+        # Require an evdev node too; enumeration can be incomplete.
+        for event_dir in "${name_file%/name}"/event*; do
+            [[ -c "/dev/input/${event_dir##*/}" ]] || continue
+            case "$name" in
+                'Synaptics TM3288-011'|'SynPS/2 Synaptics TouchPad') have_pad=1 ;;
+                'TPPS/2 Elan TrackPoint') have_point=1 ;;
+            esac
+        done
+    done
+    (( have_pad && have_point ))
+}
+
+wait_for_devices() {
+    local checks="$1" stable=0 i
+    for ((i = 0; i < checks; i++)); do
+        if devices_ready; then
+            stable=$((stable + 1))
+            (( stable >= 3 )) && return 0
+        else
+            stable=0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+reload_on_exit() {
+    local status=$?
+    trap - EXIT HUP INT TERM
+    if (( reload_needed )); then
+        log 'Recovery interrupted or failed; ensuring psmouse is loaded.'
+        if ! timeout --foreground 15s modprobe psmouse; then
+            log 'ERROR: emergency reload failed; manual recovery is required.'
+            status=1
+        fi
+    fi
+    exit "$status"
+}
+
+recover() {
+    local attempt
+    # Called after systemd-sleep finishes ALL parallel post hooks, including TLP.
+    # Allow settling even if the devices initially appear present.
+    sleep 3
+    if wait_for_devices 5; then
+        log 'Touchpad and TrackPoint are present and stable; no restart needed.'
+        return 0
+    fi
+
+    reload_needed=0
+    trap reload_on_exit EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    for attempt in 1 2; do
+        log "Input device missing; recovery attempt $attempt/2."
+        # Arm BEFORE unloading, including partial failures and signals.
+        reload_needed=1
+        if ! timeout --foreground 15s modprobe -r psmouse; then
+            log 'Unload failed; attempting reload anyway.'
+        fi
+        sleep 4
+        if timeout --foreground 15s modprobe psmouse; then
+            reload_needed=0
+            if wait_for_devices 10; then
+                log 'Touchpad and TrackPoint recovered and remained present.'
+                return 0
+            fi
+        else
+            log 'Reload failed; will retry.'
+        fi
+    done
+    log 'ERROR: devices still missing after two attempts; inspect the kernel journal.'
+    return 1
+}
+
+main() {
+    case "${1:-}" in
+        pre) return 0 ;;
+        post) ;;
+        *) log 'Usage: trackpoint-resume post'; return 2 ;;
+    esac
+    (( EUID == 0 )) || { log 'Root access required.'; return 1; }
+    # Share the former helper's lock with any old manual invocation.
+    exec 9>/run/lock/x1c6-touchpad-resume-recover.lock
+    flock -w 120 9 || { log 'ERROR: another recovery is still running.'; return 1; }
+    recover
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
